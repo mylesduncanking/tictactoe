@@ -1,0 +1,221 @@
+package main
+
+import (
+	"database/sql"
+	"fmt"
+	"math/rand"
+	"net/http"
+	"sort"
+	"strconv"
+	"strings"
+	"time"
+
+	_ "github.com/go-sql-driver/mysql"
+	"github.com/labstack/echo/v4"
+	"github.com/labstack/echo/v4/middleware"
+)
+
+type Game struct {
+	Code    string
+	P1Moves sql.NullString
+	P2Moves sql.NullString
+	Status  string
+}
+
+type Response struct {
+	success bool
+	data    string
+	message string
+}
+
+func main() {
+	e := echo.New()
+	e.Use(middleware.CORS())
+
+	// DB Connection
+	db, err := sql.Open("mysql", "root:@tcp(127.0.0.1:3306)/tictactoe")
+	if err != nil {
+		fmt.Println(err.Error())
+	}
+	defer db.Close()
+	err = db.Ping()
+	if err != nil {
+		fmt.Println(err.Error())
+	}
+
+	// Routes
+	// e.POST("/game/create", createGame)
+	e.POST("/game/create", func(c echo.Context) error {
+		// Query and params
+		sql := "INSERT INTO games(code) VALUES (?)"
+		code := generateCode(5)
+
+		// Run query
+		insert, err := db.Query(sql, code)
+
+		// If there is an error inserting, handle it
+		if err != nil {
+			return c.JSON(http.StatusInternalServerError, "Failed to create game")
+		}
+		defer insert.Close()
+
+		// Build struct
+		g := new(Game)
+		g.Code = code
+		g.Status = "waiting"
+
+		return c.JSON(http.StatusCreated, g)
+	})
+
+	e.GET("/game/:code/join", func(c echo.Context) error {
+		firstMove := strconv.Itoa(rand.Intn(2) + 1)
+		status := "player" + firstMove + "_move"
+		update, err := db.Query("UPDATE games SET status = ? WHERE code = ? AND status = ?", status, c.Param("code"), "waiting")
+		if err != nil {
+			return c.JSON(http.StatusBadRequest, "Invalid code")
+		}
+		_ = update
+
+		g := new(Game)
+		err2 := db.QueryRow("SELECT code, player1_moves, player2_moves, status FROM games WHERE code = ?", c.Param("code")).Scan(&g.Code, &g.P1Moves, &g.P2Moves, &g.Status)
+		if err2 != nil {
+			return c.JSON(http.StatusInternalServerError, "Failed to join game")
+		}
+
+		return c.JSON(http.StatusCreated, g)
+	})
+
+	e.GET("/game/:code", func(c echo.Context) error {
+		g := new(Game)
+		err := db.QueryRow("SELECT code, player1_moves, player2_moves, status FROM games WHERE code = ?", c.Param("code")).Scan(&g.Code, &g.P1Moves, &g.P2Moves, &g.Status)
+		if err != nil {
+			return c.JSON(http.StatusBadRequest, "Invalid code")
+		}
+		return c.JSON(http.StatusCreated, g)
+	})
+
+	e.POST("/game/:code/move", func(c echo.Context) error {
+		player := c.FormValue("player")
+		cell := c.FormValue("cell")
+
+		// Get current entry
+		g := new(Game)
+		err := db.QueryRow("SELECT code, player1_moves, player2_moves, status FROM games WHERE code = ?", c.Param("code")).Scan(&g.Code, &g.P1Moves, &g.P2Moves, &g.Status)
+		if err != nil {
+			return c.JSON(http.StatusInternalServerError, "Failed to get current moves")
+		}
+
+		// Ensure no crossover
+		if isCrossover(g.P1Moves.String, g.P2Moves.String, cell) {
+			return c.JSON(http.StatusBadRequest, "Cell already populated")
+		}
+
+		// Update player_moves
+		curStatus := "player1_move"
+		nextStatus := "player2_move"
+		val := cell
+		if player == "1" && g.P1Moves.Valid {
+			val = g.P1Moves.String + "," + cell
+		} else if player == "2" {
+			curStatus = "player2_move"
+			nextStatus = "player1_move"
+			if g.P2Moves.Valid {
+				val = g.P2Moves.String + "," + cell
+			}
+		}
+
+		// Format moves
+		split := strings.Split(val, ",")
+		intSlice := make([]int, len(split))
+		for i, s := range split {
+			intSlice[i], _ = strconv.Atoi(s)
+		}
+		clean := unique(intSlice)
+		sort.Ints(clean)
+		val = arrayToString(clean, ",")
+
+		// Check if win condition met
+		hasWon := checkWin(val)
+		if hasWon {
+			nextStatus = strings.Replace(curStatus, "move", "win", 1)
+		}
+
+		// Check if draw
+		if len(g.P1Moves.String)+len(g.P2Moves.String) == 14 && !hasWon {
+			nextStatus = "draw"
+		}
+
+		// Update DB
+		update, err2 := db.Query("UPDATE games SET "+curStatus+"s = ?, status = ? WHERE status = ? AND code = ?", val, nextStatus, curStatus, c.Param("code"))
+		if err2 != nil {
+			return c.JSON(http.StatusInternalServerError, "Failed to make move")
+		}
+		_ = update
+
+		// Get current
+		err3 := db.QueryRow("SELECT code, player1_moves, player2_moves, status FROM games WHERE code = ?", c.Param("code")).Scan(&g.Code, &g.P1Moves, &g.P2Moves, &g.Status)
+		if err3 != nil {
+			return c.JSON(http.StatusInternalServerError, "Failed to get game")
+		}
+		return c.JSON(http.StatusCreated, g)
+	})
+
+	// Start server
+	e.Logger.Fatal(e.Start(":1323"))
+}
+
+// Helper functions
+// -------------------------------------------
+func generateCode(n int) string {
+	// Regenerate seed so code is unique
+	rand.Seed(time.Now().UnixNano())
+
+	// Available characters
+	var letters = []rune("02345689") // 1 and 7 removed as can look similar
+
+	// Build string
+	b := make([]rune, n)
+	for i := range b {
+		b[i] = letters[rand.Intn(len(letters))]
+	}
+
+	return string(b)
+}
+
+func isCrossover(p1 string, p2 string, c string) bool {
+	return strings.Contains(p1, c) || strings.Contains(p2, c)
+}
+
+func checkWin(m string) bool {
+	winConditions := []string{
+		"1,2,3", "4,5,6", "7,8,9", // Rows
+		"1,4,7", "2,5,8", "3,6,9", // Cols
+		"1,5,9", "3,5,7", // Diags
+	}
+	isWin := false
+	for _, cond := range winConditions {
+		c := strings.Split(cond, ",")
+		if strings.Contains(m, c[0]) && strings.Contains(m, c[1]) && strings.Contains(m, c[2]) {
+			isWin = true
+		}
+	}
+	return isWin
+}
+
+// https://www.golangprograms.com/remove-duplicate-values-from-slice.html
+func unique(intSlice []int) []int {
+	keys := make(map[int]bool)
+	list := []int{}
+	for _, entry := range intSlice {
+		if _, value := keys[entry]; !value {
+			keys[entry] = true
+			list = append(list, entry)
+		}
+	}
+	return list
+}
+
+// https://stackoverflow.com/questions/37532255/one-liner-to-transform-int-into-string
+func arrayToString(a []int, delim string) string {
+	return strings.Trim(strings.Replace(fmt.Sprint(a), " ", delim, -1), "[]")
+}
